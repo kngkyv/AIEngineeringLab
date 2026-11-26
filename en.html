@@ -123,20 +123,43 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':
 const store = { get(k){ try{return localStorage.getItem(k)}catch(e){return null} }, set(k,v){ try{localStorage.setItem(k,v)}catch(e){} } };
 
 // ---------- API ----------
-async function callModel({system, messages, tools, tool_choice, max_tokens=1800, trace}) {
+// Current models may spend part of the output budget on internal reasoning before writing. A small max_tokens can
+// therefore be used up before any visible text appears, so the budget is generous and an empty, cut-off reply is retried.
+const MIN_BUDGET = 16000;
+async function callModel({system, messages, tools, tool_choice, max_tokens=0, trace}) {
   const key = $('#apikey').value.trim(); if (!key) throw new Error(UI.no_key);
-  const body = { model: $('#model').value, max_tokens, messages };
-  if (system) body.system = system; if (tools) body.tools = tools; if (tool_choice) body.tool_choice = tool_choice;
-  const r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST',
-    headers: {'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-    body: JSON.stringify(body) });
-  const j = await r.json();
-  if (!r.ok) throw new Error((j.error && j.error.message) || ('HTTP '+r.status));
-  if (trace) trace.calls = (trace.calls||0)+1, trace.tokens = (trace.tokens||0) + (j.usage ? j.usage.input_tokens + j.usage.output_tokens : 0);
+  let budget = Math.max(max_tokens, MIN_BUDGET), j;
+  for (let attempt=0; attempt<2; attempt++){
+    const body = { model: $('#model').value, max_tokens: budget, messages };
+    if (system) body.system = system; if (tools) body.tools = tools; if (tool_choice) body.tool_choice = tool_choice;
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST',
+      headers: {'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+      body: JSON.stringify(body) });
+    j = await r.json();
+    if (!r.ok) {
+      const msg = (j.error && j.error.message) || ('HTTP '+r.status);
+      if (attempt===0 && /max_tokens/i.test(msg) && budget > 8000) { budget = 8000; continue; }   // model with a smaller output limit
+      throw new Error(msg);
+    }
+    if (trace) trace.calls = (trace.calls||0)+1, trace.tokens = (trace.tokens||0) + (j.usage ? j.usage.input_tokens + j.usage.output_tokens : 0);
+    const visible = (j.content||[]).some(b => (b.type==='text' && b.text && b.text.trim()) || b.type==='tool_use');
+    if (j.stop_reason==='max_tokens' && !visible && attempt===0) { budget = budget*2; continue; }       // budget used up before any visible output
+    break;
+  }
+  const hasOut = (j.content||[]).some(b => (b.type==='text' && b.text && b.text.trim()) || b.type==='tool_use');
+  if (!hasOut) throw new Error(LANG==='ko' ? '모델이 빈 응답을 돌려주었습니다. 다시 실행해 보세요.' : 'The model returned an empty response. Please run again.');
+  if (j.stop_reason==='max_tokens' && trace) trace.steps.push({cls:'bad', k: LANG==='ko'?'응답이 길이 한도에서 잘림':'response cut off at the length limit', text: LANG==='ko'?'결과가 중간에 끊겼을 수 있습니다':'the output may be incomplete'});
   return j;
 }
 const textOf = j => (j.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\n').trim();
 function parseJSON(s){ s = String(s||'').replace(/```(?:json)?/gi,''); const m = s.match(/\{[\s\S]*\}|\[[\s\S]*\]/); if(!m) throw new Error('no JSON'); return JSON.parse(m[0]); }
+// Structured answers are collected through a forced tool ("form") call instead of parsing JSON out of free text.
+async function callForm({system, messages, tool, trace, max_tokens=0}) {
+  const j = await callModel({system, messages, tools:[tool], tool_choice:{type:'tool', name:tool.name}, max_tokens, trace});
+  const u = (j.content||[]).find(b=>b.type==='tool_use' && b.name===tool.name);
+  if (u && u.input && typeof u.input==='object') return u.input;
+  return parseJSON(textOf(j));
+}
 
 // ---------- state ----------
 const state = {}; // taskId -> {prompt, ctx:Set, harness:Set, preset}
@@ -225,11 +248,17 @@ RUNNERS.cs = async (t, cfg, trace) => {
     const j = await callModel({messages:[{role:'user',content:user}], trace}); draft = textOf(j);
     trace.steps.push({k:`${LANG==='ko'?'초안':'draft'} #${i+1}`, text: draft.slice(0,160)+(draft.length>160?'…':'')});
     if (!cfg.harness.includes('checker')) break;
-    const chk = await callModel({ max_tokens:600, trace, system: LANG==='ko'
-      ? '당신은 고객센터 품질관리 검사기입니다. 주어진 정책과 답장 초안을 대조해 JSON만 출력하세요: {"pass": true|false, "violations": ["위반 항목 번호와 근거 문장"]}. 정책이 금지한 약속(환불·교환·쿠폰·보상), 과실 인정 표현, 위협에 대한 협상, 정책과 다른 기간 안내를 모두 위반으로 봅니다. 애매하면 위반으로 판정합니다.'
-      : 'You are a customer-service QA checker. Compare the policy with the draft reply and output JSON only: {"pass": true|false, "violations": ["policy item number and the offending sentence"]}. Promises the policy forbids (refund, exchange, coupon, compensation), admissions of fault, negotiating with threats, and incorrect time windows all count as violations. When in doubt, flag it.',
-      messages:[{role:'user',content:`<policy>\n${policy}\n</policy>\n<draft>\n${draft}\n</draft>`}] });
-    let v; try { v = parseJSON(textOf(chk)); } catch(e){ v = {pass:false, violations:['checker returned non-JSON: '+textOf(chk).slice(0,120)]}; }
+    let v;
+    try {
+      v = await callForm({ trace,
+        system: LANG==='ko'
+          ? '당신은 고객센터 품질관리 검사기입니다. 주어진 정책과 답장 초안을 대조해 report_check 양식으로 결과를 제출하세요. 정책이 금지한 약속(환불·교환·쿠폰·보상), 과실 인정 표현, 위협에 대한 협상, 정책과 다른 기간 안내를 모두 위반으로 봅니다. 애매하면 위반으로 판정합니다. 위반이 없으면 pass는 true, violations는 빈 배열입니다.'
+          : 'You are a customer-service QA checker. Compare the policy with the draft reply and submit the result with the report_check form. Promises the policy forbids (refund, exchange, coupon, compensation), admissions of fault, negotiating with threats, and incorrect time windows all count as violations. When in doubt, flag it. If there are none, pass is true and violations is an empty array.',
+        tool: {name:'report_check', description: LANG==='ko'?'정책 준수 검사 결과를 제출합니다.':'Submits the policy-compliance check result.',
+          input_schema:{type:'object', required:['pass','violations'], properties:{pass:{type:'boolean'}, violations:{type:'array', items:{type:'string', description: LANG==='ko'?'위반한 정책 항목 번호와 해당 문장':'policy item number and the offending sentence'}}}}},
+        messages:[{role:'user',content:`<policy>\n${policy}\n</policy>\n<draft>\n${draft}\n</draft>`}] });
+      if (typeof v.pass !== 'boolean') v.pass = !(v.violations||[]).length;
+    } catch(e){ v = {pass:false, violations:[(LANG==='ko'?'검사기 응답을 읽지 못했습니다: ':'could not read the checker response: ') + e.message]}; }
     if (v.pass) { trace.steps.push({cls:'ok', k:`${LANG==='ko'?'정책 검사':'policy check'} #${i+1} · ${UI.pass}`, text:''}); break; }
     feedback = (v.violations||[]).map(x=>'- '+x).join('\n');
     trace.steps.push({cls:'bad', k:`${LANG==='ko'?'정책 검사':'policy check'} #${i+1} · ${UI.fail}`, pre:feedback});
@@ -276,11 +305,21 @@ RUNNERS.hr = async (t, cfg, trace) => {
   if (!indep){ const j = await callModel({messages:[{role:'user',content:buildUser(t,cfg,tf)}], trace}); return { text: textOf(j) }; }
   const refs = t.materials.filter(m=>cfg.ctx.includes(m.id) && m.id!=='resumes').map(m=>`<${m.id}>\n${m.text}\n</${m.id}>`).join('\n\n');
   const sys = LANG==='ko'
-    ? '당신은 채용 스크리닝 채점기입니다. 한 명의 후보만 평가합니다. 다른 후보와 비교하지 마세요. 제공된 공고와 채점 기준(있는 경우)에 따라 JSON만 출력하세요: {"m1":true|false,"m2":true|false,"m3":true|false,"qualified":true|false,"score":0-10,"evidence":"한 줄 근거"}. 공고가 없으면 필수요건을 SQL 5년·팀관리 1년·비즈니스 한국어로 가정하세요. 직함·수식어가 아닌 구체적 기간과 수행 내용으로 판단합니다. 부적격이면 score는 0.'
-    : 'You are a hiring-screen scorer. Evaluate exactly one candidate; do not compare with others. Following the posting and rubric (if provided), output JSON only: {"m1":true|false,"m2":true|false,"m3":true|false,"qualified":true|false,"score":0-10,"evidence":"one line"}. If no posting is given, assume must-haves of 5 years SQL, 1 year people management, business Korean. Judge by concrete durations and duties, not titles. If not qualified, score is 0.';
+    ? '당신은 채용 스크리닝 채점기입니다. 한 명의 후보만 평가합니다. 다른 후보와 비교하지 마세요. 제공된 공고와 채점 기준(있는 경우)에 따라 평가하고 score_candidate 양식으로 제출하세요. 공고가 없으면 필수요건을 (1) SQL 실무 5년 이상 (2) 팀 관리 1년 이상 (3) 비즈니스 수준 한국어로 가정하세요. 직함·수식어가 아닌 구체적 기간과 수행 내용으로 판단합니다. 필수요건을 하나라도 충족하지 못하면 qualified는 false, score는 0입니다.'
+    : 'You are a hiring-screen scorer. Evaluate exactly one candidate; do not compare with others. Evaluate against the posting and rubric (if provided) and submit with the score_candidate form. If no posting is given, assume the must-haves are (1) 5+ years hands-on SQL (2) 1+ year people management (3) business-level Korean. Judge by concrete durations and duties, not titles. If any must-have is not met, qualified is false and score is 0.';
+  const scoreTool = {name:'score_candidate', description: LANG==='ko'?'후보 한 명의 채점 결과를 제출합니다.':'Submits the scoring result for one candidate.',
+    input_schema:{type:'object', required:['m1','m2','m3','qualified','score','evidence'], properties:{
+      m1:{type:'boolean', description: LANG==='ko'?'필수요건 1 (SQL 5년 이상) 충족':'must-have 1 (5+ years SQL) met'},
+      m2:{type:'boolean', description: LANG==='ko'?'필수요건 2 (팀 관리 1년 이상) 충족':'must-have 2 (1+ year people management) met'},
+      m3:{type:'boolean', description: LANG==='ko'?'필수요건 3 (비즈니스 한국어) 충족':'must-have 3 (business Korean) met'},
+      qualified:{type:'boolean'}, score:{type:'number', description:'0-10'},
+      evidence:{type:'string', description: LANG==='ko'?'판정 근거 한 문장':'one-sentence evidence'}}}};
   const results = await Promise.all(t.resumes.map(async (r,i)=>{
-    const j = await callModel({max_tokens:400, trace, system:sys, messages:[{role:'user',content:`${refs}\n\n<candidate id="${t.labels[i]}">\n${doBlind?blind(r):r}\n</candidate>\n\n${cfg.prompt}`}]});
-    let v; try{ v=parseJSON(textOf(j)); }catch(e){ v={m1:null,m2:null,m3:null,qualified:false,score:0,evidence:'non-JSON: '+textOf(j).slice(0,80)}; }
+    let v;
+    try {
+      v = await callForm({trace, system:sys, tool:scoreTool, messages:[{role:'user',content:`${refs}\n\n<candidate id="${t.labels[i]}">\n${doBlind?blind(r):r}\n</candidate>\n\n${LANG==='ko'?'위 후보 한 명을 채점해 score_candidate 양식으로 제출하세요.':'Score this one candidate and submit with the score_candidate form.'}`}]});
+      v.score = Number(v.score)||0; if (v.qualified===false) v.score = 0;
+    } catch(e){ v={m1:null,m2:null,m3:null,qualified:false,score:0,evidence:(LANG==='ko'?'채점 응답을 읽지 못했습니다: ':'could not read the scorer response: ')+e.message}; }
     trace.steps.push({cls: v.qualified?'ok':'bad', k:`${UI.candidate} ${t.labels[i]} · ${UI.score} ${v.score}`, text:v.evidence});
     return {id:t.labels[i], ...v};
   }));
