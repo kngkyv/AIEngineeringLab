@@ -193,7 +193,7 @@ async function runTask(t, compare){
   const out = $('#out'); const btns=[$('#run'),$('#cmp')]; btns.forEach(b=>b.disabled=true);
   const slot = (lab) => `<div><p class="lab">${lab}</p><div class="box"><span class="status"><span class="dot"></span>${UI.running}</span></div><div class="trace"></div><div class="meta"></div></div>`;
   out.innerHTML = compare ? `<div class="twin">${slot(UI.naive_out)}${slot(UI.your_out)}</div>` : slot(UI.your_out);
-  const slots = out.querySelectorAll('.twin > div, .out > div');
+  const slots = compare ? out.querySelectorAll('.twin > div') : [out.firstElementChild];
   const jobs = compare ? [[naiveConfig(t), slots[0]], [configOf(t), slots[1]]] : [[configOf(t), slots[0]]];
   await Promise.all(jobs.map(async ([cfg, el]) => {
     const trace = { steps:[], calls:0, tokens:0 };
